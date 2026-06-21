@@ -89,14 +89,24 @@ std::vector<TrackPoint> decodeCat062(const uint8_t* data, size_t len) {
 
         if (fspecHasItemCat062(fspec, 8)) {
             int32_t raw_lat = br.readS32(32);
+            raw_lat = clampI32(raw_lat, -1073741823, 1073741823);
             tp.latitude = static_cast<double>(raw_lat) * 180.0 / 2147483648.0;
-            has_wgs_lat = true;
+            if (tp.latitude < -90.0 || tp.latitude > 90.0 || !std::isfinite(tp.latitude)) {
+                tp.latitude = 0; has_wgs_lat = false;
+            } else {
+                has_wgs_lat = true;
+            }
         }
 
         if (fspecHasItemCat062(fspec, 9)) {
             int32_t raw_lon = br.readS32(32);
+            raw_lon = clampI32(raw_lon, -2147483647, 2147483647);
             tp.longitude = static_cast<double>(raw_lon) * 180.0 / 2147483648.0;
-            has_wgs_lon = true;
+            if (tp.longitude < -180.0 || tp.longitude > 180.0 || !std::isfinite(tp.longitude)) {
+                tp.longitude = 0; has_wgs_lon = false;
+            } else {
+                has_wgs_lon = true;
+            }
         }
 
         if (has_wgs_lat && has_wgs_lon) {
@@ -114,8 +124,26 @@ std::vector<TrackPoint> decodeCat062(const uint8_t* data, size_t len) {
         }
 
         if (fspecHasItemCat062(fspec, 12)) {
-            uint16_t alt_raw = br.readU16(16);
-            tp.altitude_fl = static_cast<double>(alt_raw) * 6.25 / 100.0;
+            uint16_t alt_raw = static_cast<uint16_t>(br.readU32(16) & 0xFFFF);
+            bool valid_bit = (alt_raw & 0x4000) != 0;
+            bool metric_g = (alt_raw & 0x8000) != 0;
+            uint16_t alt_value = static_cast<uint16_t>(alt_raw & 0x3FFF);
+
+            double flight_level;
+            if (metric_g) {
+                double meters = static_cast<double>(alt_value) * 6.25;
+                meters = (meters < 0) ? 0 : meters;
+                if (meters > 20000) meters = 20000;
+                flight_level = (meters / 30.48) / 100.0;
+            } else {
+                flight_level = static_cast<double>(alt_value) * 6.25 / 100.0;
+            }
+
+            if (!valid_bit || flight_level < 0 || flight_level > 700) {
+                if (!valid_bit) flight_level = 0;
+                flight_level = (flight_level < -12) ? -12 : (flight_level > 700 ? 700 : flight_level);
+            }
+            tp.altitude_fl = flight_level;
             tp.has_altitude = true;
         }
 

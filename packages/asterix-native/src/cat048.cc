@@ -88,19 +88,36 @@ std::vector<TrackPoint> decodeCat048(const uint8_t* data, size_t len, const Rada
         }
 
         if (fspecHasItem(fspec, 7)) {
-            uint32_t alt_code = br.readU32(16);
-            if (alt_code & 0x0040) {
-                uint32_t num = ((alt_code & 0x001F) << 8) | ((alt_code & 0x0F00) >> 4) |
-                               ((alt_code & 0x0020) << 5) | ((alt_code & 0xE000) >> 7);
-                int32_t feet = static_cast<int32_t>(num) * 100 - 1200;
+            uint16_t alt_code_16 = static_cast<uint16_t>(br.readU32(16) & 0xFFFF);
+            bool fe_mode = (alt_code_16 & 0x0040) != 0;
+
+            if (fe_mode) {
+                int32_t feet = decodeAltitudeGillhamFE(alt_code_16);
+                if (feet < -90000) {
+                    uint32_t num = ((alt_code_16 & 0x001F) << 8) | ((alt_code_16 & 0x0F00) >> 4) |
+                                   ((alt_code_16 & 0x0020) << 5) | ((alt_code_16 & 0xE000) >> 7);
+                    num &= 0x7FF;
+                    feet = static_cast<int32_t>(num) * 100 - 1200;
+                }
+                feet = clampI32(feet, -1200, 65000);
                 tp.altitude_fl = static_cast<double>(feet) / 100.0;
                 tp.has_altitude = true;
             } else {
-                uint32_t num = ((alt_code & 0x0010) << 4) | ((alt_code & 0x000F) << 2) |
-                               ((alt_code & 0x0080) >> 6) | ((alt_code & 0x0020) >> 5) |
-                               ((alt_code & 0x0F00) >> 8) | ((alt_code & 0xE000) >> 11);
-                int32_t metric = static_cast<int32_t>(num) * 25;
-                tp.altitude_fl = static_cast<double>(metric) / 30.48 / 100.0;
+                uint32_t num =
+                    ((alt_code_16 & 0x0010u) << 4u) |
+                    ((alt_code_16 & 0x000Fu) << 2u) |
+                    ((alt_code_16 & 0x0080u) >> 6u) |
+                    ((alt_code_16 & 0x0020u) >> 5u) |
+                    ((alt_code_16 & 0x0F00u) >> 8u) |
+                    ((alt_code_16 & 0xE000u) >> 11u);
+                num &= 0x0FFF;
+                int32_t metric_raw = static_cast<int32_t>(num);
+                if (metric_raw & 0x0800) {
+                    metric_raw |= ~static_cast<int32_t>(0x0FFF);
+                }
+                int32_t meters = metric_raw * 25;
+                meters = clampI32(meters, -500, 20000);
+                tp.altitude_fl = (static_cast<double>(meters) / 30.48) / 100.0;
                 tp.has_altitude = true;
             }
         }

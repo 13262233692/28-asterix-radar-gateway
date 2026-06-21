@@ -4,15 +4,18 @@ const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const v8 = require('v8');
 
 const UdpMulticastListener = require('./udpListener');
 const TrackManager = require('./trackManager');
-const { decode } = require('@asterix/native');
+const { decode, decodeBinary, resetPool, TRACK_BINARY_SIZE, clamp } = require('@asterix/native');
 
 const PORT = process.env.PORT || 8090;
 const WS_PORT = process.env.WS_PORT || 8091;
 const BROADCAST_HZ = 20;
 const BROADCAST_INTERVAL_MS = Math.floor(1000 / BROADCAST_HZ);
+
+const MEMORY_LOG_INTERVAL_MS = 30000;
 
 const app = express();
 app.use(cors());
@@ -57,11 +60,15 @@ const clients = new Set();
 wss.on('connection', (ws) => {
     clients.add(ws);
 
-    ws.send(JSON.stringify({
-        type: 'snapshot',
-        timestamp: Date.now(),
-        tracks: trackManager.getFullSnapshot()
-    }));
+    try {
+        const snapshot = trackManager.getFullSnapshot();
+        ws.send(JSON.stringify({
+            type: 'snapshot',
+            timestamp: Date.now(),
+            count: snapshot.length,
+            tracks: snapshot
+        }));
+    } catch (e) {}
 
     ws.on('close', () => {
         clients.delete(ws);
@@ -74,7 +81,12 @@ wss.on('connection', (ws) => {
 });
 
 function broadcastMessage(msg) {
-    const data = JSON.stringify(msg);
+    let data;
+    try {
+        data = JSON.stringify(msg);
+    } catch (e) {
+        return;
+    }
     for (const client of clients) {
         if (client.readyState === WebSocket.OPEN) {
             try {
@@ -86,28 +98,52 @@ function broadcastMessage(msg) {
 
 let pendingUpdates = [];
 trackManager.on('update', (tracks) => {
-    for (const t of tracks) pendingUpdates.push(t);
+    for (let i = 0; i < tracks.length; i++) pendingUpdates.push(tracks[i]);
 });
 
+const snapshotTempMap = new Map();
+
 setInterval(() => {
-    if (pendingUpdates.length === 0) return;
+    if (pendingUpdates.length === 0 && snapshotTempMap.size === 0) return;
 
-    const uniqueMap = new Map();
-    for (const t of pendingUpdates) {
-        const withTrail = {
-            ...t,
-            trail: trackManager.getHistory(t.key)
-        };
-        uniqueMap.set(t.key, withTrail);
+    const uniqueMap = snapshotTempMap;
+    for (let i = 0; i < pendingUpdates.length; i++) {
+        const t = pendingUpdates[i];
+        if (!t || !t.key) continue;
+        const hist = trackManager.getHistory(t.key);
+        uniqueMap.set(t.key, {
+            modeSAddress: t.modeSAddress,
+            trackNumber: t.trackNumber,
+            latitude: t.latitude,
+            longitude: t.longitude,
+            flightLevel: clamp(t.flightLevel || 0, -12, 700),
+            groundSpeed: t.groundSpeed || 0,
+            trackAngle: t.trackAngle || 0,
+            timeOfDay: t.timeOfDay || 0,
+            hasModeS: t.hasModeS,
+            hasPosition: t.hasPosition,
+            hasAltitude: t.hasAltitude,
+            callsign: t.callsign || '',
+            key: t.key,
+            lastUpdate: t.lastUpdate,
+            source: t.source || 0,
+            trailLength: hist ? hist.length : 0,
+            trail: hist || []
+        });
     }
+    pendingUpdates.length = 0;
 
-    broadcastMessage({
-        type: 'update',
-        timestamp: Date.now(),
-        tracks: Array.from(uniqueMap.values())
-    });
-
-    pendingUpdates = [];
+    if (uniqueMap.size > 0) {
+        const arr = [];
+        for (const v of uniqueMap.values()) arr.push(v);
+        broadcastMessage({
+            type: 'update',
+            timestamp: Date.now(),
+            count: arr.length,
+            tracks: arr
+        });
+        uniqueMap.clear();
+    }
 }, BROADCAST_INTERVAL_MS);
 
 setInterval(() => {
@@ -121,6 +157,23 @@ setInterval(() => {
     }
 }, 5000);
 
+setInterval(() => {
+    try {
+        resetPool();
+    } catch (e) {}
+    if (global.gc) {
+        try { global.gc(); } catch (e) {}
+    }
+}, 15000);
+
+setInterval(() => {
+    try {
+        const mem = process.memoryUsage();
+        const poolStats = trackManager.getPoolStats ? trackManager.getPoolStats() : {};
+        console.log(`[MEM] RSS=${(mem.rss/1048576).toFixed(1)}MB  HeapUsed=${(mem.heapUsed/1048576).toFixed(1)}/${(mem.heapTotal/1048576).toFixed(1)}MB  External=${(mem.external/1048576).toFixed(1)}MB  Tracks=${trackManager.getTrackCount()}  PoolStats=${JSON.stringify(poolStats)}`);
+    } catch (e) {}
+}, MEMORY_LOG_INTERVAL_MS);
+
 app.get('/api/tracks', (req, res) => {
     res.json({
         timestamp: Date.now(),
@@ -130,6 +183,7 @@ app.get('/api/tracks', (req, res) => {
 });
 
 app.get('/api/stats', (req, res) => {
+    const mem = process.memoryUsage();
     res.json({
         timestamp: Date.now(),
         decoder: decoderStats,
@@ -139,7 +193,14 @@ app.get('/api/stats', (req, res) => {
         },
         websocket: {
             connectedClients: clients.size
-        }
+        },
+        memory: {
+            rssMB: (mem.rss / 1048576).toFixed(1),
+            heapUsedMB: (mem.heapUsed / 1048576).toFixed(1),
+            heapTotalMB: (mem.heapTotal / 1048576).toFixed(1)
+        },
+        pools: trackManager.getPoolStats ? trackManager.getPoolStats() : {},
+        trackBinarySize: TRACK_BINARY_SIZE
     });
 });
 
@@ -164,20 +225,47 @@ app.post('/api/asterix', express.raw({ type: '*/*', limit: '10mb' }), (req, res)
     }
 });
 
-app.post('/api/tracks/batch', express.json(), (req, res) => {
+app.post('/api/asterix/binary', express.raw({ type: '*/*', limit: '10mb' }), (req, res) => {
+    try {
+        const radarOpt = radarConfigs['239.192.0.1'];
+        const binResult = decodeBinary(Buffer.from(req.body), radarOpt);
+        decoderStats.totalPackets++;
+        res.set('Content-Type', 'application/octet-stream');
+        res.send(Buffer.from(binResult));
+    } catch (err) {
+        decoderStats.errors++;
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+app.post('/api/tracks/batch', express.json({ limit: '50mb' }), (req, res) => {
     try {
         const tracks = req.body.tracks || [];
-        for (const t of tracks) {
+        for (let i = 0; i < tracks.length; i++) {
+            const t = tracks[i];
             t.hasPosition = !!t.latitude && !!t.longitude;
             t.hasModeS = !!t.modeSAddress;
             t.hasAltitude = !!t.flightLevel;
+            if (t.flightLevel !== undefined) {
+                t.flightLevel = clamp(Number(t.flightLevel) || 0, -12, 700);
+            }
             if (!t.key) {
-                t.key = t.modeSAddress ? `S_${t.modeSAddress.toString(16)}` : `T_${t.trackNumber}`;
+                t.key = t.modeSAddress ? 'S_' + t.modeSAddress.toString(16) : 'T_' + t.trackNumber;
             }
             t.lastUpdate = Date.now();
         }
         trackManager.update(tracks, { category: 255 });
         res.json({ ok: true, received: tracks.length, active: trackManager.getTrackCount() });
+    } catch (err) {
+        res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
+app.post('/api/pool/reset', (req, res) => {
+    try {
+        resetPool();
+        const before = trackManager.getPoolStats ? trackManager.getPoolStats() : {};
+        res.json({ ok: true, before, after: trackManager.getPoolStats ? trackManager.getPoolStats() : before });
     } catch (err) {
         res.status(500).json({ ok: false, error: err.message });
     }
@@ -196,7 +284,11 @@ async function start() {
     });
 
     console.log(`[WS] WebSocket server on ws://localhost:${WS_PORT} (${BROADCAST_HZ}Hz broadcast)`);
-    console.log(`[SYSTEM] ATC Radar Gateway ready — max 800 targets @ 20FPS`);
+    console.log(`[SYSTEM] ATC Radar Gateway ready — max 1200 targets @ 20FPS (zero-copy binary + object pool)`);
+    try {
+        const mem = process.memoryUsage();
+        console.log(`[MEM] Initial: RSS=${(mem.rss/1048576).toFixed(1)}MB`);
+    } catch (e) {}
 }
 
 start().catch(err => {
