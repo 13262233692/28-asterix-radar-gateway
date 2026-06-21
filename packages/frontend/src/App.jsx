@@ -8,12 +8,14 @@ const WS_URL = (typeof window !== 'undefined' &&
   : `ws://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8091`;
 
 export default function App() {
-  const { tracksRef, connected, stats, tickFrame } = useTrackStore(WS_URL);
+  const { tracksRef, stcaConflictsRef, stcaConflictKeysRef, connected, stats, tickFrame } = useTrackStore(WS_URL);
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <RadarDisplay
         tracksRef={tracksRef}
+        stcaConflictsRef={stcaConflictsRef}
+        stcaConflictKeysRef={stcaConflictKeysRef}
         connected={connected}
         stats={stats}
         tickFrame={tickFrame}

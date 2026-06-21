@@ -138,6 +138,36 @@ const SWEEP_FRAG = `
   }
 `;
 
+const STCA_VERT = `
+  attribute vec2 a_position;
+  attribute float a_severity;
+  uniform vec2 u_resolution;
+  uniform vec2 u_center;
+  uniform float u_scale;
+  varying float v_severity;
+  void main() {
+    vec2 scaled = a_position * u_scale + u_center;
+    vec2 clip = (scaled / u_resolution) * 2.0 - 1.0;
+    clip.y = -clip.y;
+    gl_Position = vec4(clip, 0.0, 1.0);
+    v_severity = a_severity;
+  }
+`;
+
+const STCA_FRAG = `
+  precision mediump float;
+  varying float v_severity;
+  uniform float u_time;
+  uniform float u_alpha;
+  void main() {
+    float flash = sin(u_time * 50.0) * 0.5 + 0.5;
+    flash = flash * 0.7 + 0.3;
+    float intensity = flash * v_severity;
+    float glow = intensity * 1.5;
+    gl_FragColor = vec4(1.0, glow * 0.15, glow * 0.05, intensity * u_alpha);
+  }
+`;
+
 export class RadarPpiRendererV2 {
   constructor(canvas) {
     this.canvas = canvas;
@@ -161,6 +191,7 @@ export class RadarPpiRendererV2 {
     this.sweepAngle = 0;
     this.lastTime = performance.now();
     this.sweepRpm = 15;
+    this.stcaConflicts = [];
 
     this._init();
     this.resize();
@@ -172,6 +203,7 @@ export class RadarPpiRendererV2 {
     this.dashed = this._makeProgram(DASHED_VERT, DASHED_FRAG, ['a_position', 'a_distance']);
     this.trail = this._makeProgram(TRAIL_VERT, TRAIL_FRAG, ['a_position', 'a_color']);
     this.sweep = this._makeProgram(SWEEP_VERT, SWEEP_FRAG, ['a_position']);
+    this.stca = this._makeProgram(STCA_VERT, STCA_FRAG, ['a_position', 'a_severity']);
 
     this._buildStaticGeometry();
 
@@ -179,6 +211,8 @@ export class RadarPpiRendererV2 {
     this.planeCount = 0;
     this.trailBuf = gl.createBuffer();
     this.trailCount = 0;
+    this.stcaBuf = gl.createBuffer();
+    this.stcaCount = 0;
   }
 
   _makeProgram(vsSrc, fsSrc, attribs) {
@@ -296,6 +330,8 @@ export class RadarPpiRendererV2 {
 
   updateTracks(map) { this.tracks = map; }
 
+  updateStcaConflicts(conflicts) { this.stcaConflicts = conflicts; }
+
   _project(track) {
     if (!track.hasPosition) return null;
     return projectToLocal(track.latitude, track.longitude, this.centerLat, this.centerLon);
@@ -411,12 +447,14 @@ export class RadarPpiRendererV2 {
 
     this._updatePlaneBuffer();
     this._updateTrailBuffer();
+    this._updateStcaBuffer();
 
     this._drawSweep();
     this._drawAzimuth();
     this._drawRings();
     this._drawTrails();
     this._drawPlanes();
+    this._drawStca();
   }
 
   _drawSweep() {
@@ -530,6 +568,51 @@ export class RadarPpiRendererV2 {
     gl.vertexAttribPointer(p.a_color, 3, gl.FLOAT, false, 20, 8);
 
     gl.drawArrays(gl.TRIANGLES, 0, this.planeCount);
+  }
+
+  _updateStcaBuffer() {
+    const gl = this.gl;
+    const data = [];
+
+    for (const c of this.stcaConflicts) {
+      const p1 = projectToLocal(c.lat1, c.lon1, this.centerLat, this.centerLon);
+      const p2 = projectToLocal(c.lat2, c.lon2, this.centerLat, this.centerLon);
+      const d1 = Math.sqrt(p1.x * p1.x + p1.y * p1.y);
+      const d2 = Math.sqrt(p2.x * p2.x + p2.y * p2.y);
+      if (d1 > this.rangeNm * 1852 || d2 > this.rangeNm * 1852) continue;
+      const severity = c.severity || 1.0;
+      data.push(p1.x, p1.y, severity, p2.x, p2.y, severity);
+    }
+
+    this.stcaCount = data.length / 3;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stcaBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.DYNAMIC_DRAW);
+  }
+
+  _drawStca() {
+    if (this.stcaCount === 0) return;
+    const gl = this.gl;
+    const p = this.stca;
+    gl.useProgram(p.program);
+
+    gl.uniform2f(gl.getUniformLocation(p.program, 'u_resolution'), this.width, this.height);
+    gl.uniform2f(gl.getUniformLocation(p.program, 'u_center'), this.centerPx.x, this.centerPx.y);
+    gl.uniform1f(gl.getUniformLocation(p.program, 'u_scale'), 1.0 / this.metersPerPx);
+    gl.uniform1f(gl.getUniformLocation(p.program, 'u_time'), performance.now() / 1000.0);
+    gl.uniform1f(gl.getUniformLocation(p.program, 'u_alpha'), 1.0);
+
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stcaBuf);
+    gl.enableVertexAttribArray(p.a_position);
+    gl.vertexAttribPointer(p.a_position, 2, gl.FLOAT, false, 12, 0);
+    gl.enableVertexAttribArray(p.a_severity);
+    gl.vertexAttribPointer(p.a_severity, 1, gl.FLOAT, false, 12, 8);
+
+    gl.lineWidth(2);
+    gl.drawArrays(gl.LINES, 0, this.stcaCount);
+
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   getScreenPos(track) {

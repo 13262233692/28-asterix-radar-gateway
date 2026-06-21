@@ -4,17 +4,18 @@ const WebSocket = require('ws');
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
-const v8 = require('v8');
 
 const UdpMulticastListener = require('./udpListener');
 const TrackManager = require('./trackManager');
+const STCAEngine = require('./stcaEngine');
 const { decode, decodeBinary, resetPool, TRACK_BINARY_SIZE, clamp } = require('@asterix/native');
 
 const PORT = process.env.PORT || 8090;
 const WS_PORT = process.env.WS_PORT || 8091;
 const BROADCAST_HZ = 20;
 const BROADCAST_INTERVAL_MS = Math.floor(1000 / BROADCAST_HZ);
-
+const STCA_HZ = 5;
+const STCA_INTERVAL_MS = Math.floor(1000 / STCA_HZ);
 const MEMORY_LOG_INTERVAL_MS = 30000;
 
 const app = express();
@@ -25,6 +26,15 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ port: WS_PORT });
 
 const trackManager = new TrackManager();
+const stcaEngine = new STCAEngine({
+    horizSepM: 5 * 1852,
+    vertSepFt: 1000,
+    predictionHorizonS: 120,
+    predictionStepS: 10
+});
+
+let lastStcaConflictKeys = new Set();
+let stcaAlertCount = 0;
 
 const decoderStats = { totalPackets: 0, totalTracks: 0, errors: 0 };
 
@@ -69,6 +79,16 @@ wss.on('connection', (ws) => {
             tracks: snapshot
         }));
     } catch (e) {}
+
+    if (stcaEngine.conflictList.length > 0) {
+        try {
+            ws.send(JSON.stringify({
+                type: 'stca',
+                timestamp: Date.now(),
+                conflicts: stcaEngine.conflictList
+            }));
+        } catch (e) {}
+    }
 
     ws.on('close', () => {
         clients.delete(ws);
@@ -147,6 +167,43 @@ setInterval(() => {
 }, BROADCAST_INTERVAL_MS);
 
 setInterval(() => {
+    try {
+        const conflicts = stcaEngine.run(trackManager.tracks);
+        const newKeys = stcaEngine.getConflictKeys();
+
+        if (conflicts.length > 0) {
+            broadcastMessage({
+                type: 'stca',
+                timestamp: Date.now(),
+                count: conflicts.length,
+                conflicts: conflicts
+            });
+
+            for (const k of newKeys) {
+                if (!lastStcaConflictKeys.has(k)) {
+                    stcaAlertCount++;
+                    const c = conflicts.find(c => c.key1 === k || c.key2 === k);
+                    if (c) {
+                        console.log(`[STCA] ⚠️  CONFLICT: ${c.callsign1 || c.key1} ↔ ${c.callsign2 || c.key2}  H=${c.horizSepNm}NM  V=${c.vertSepFt}ft  CPA=${c.timeToCPA}s`);
+                    }
+                }
+            }
+        } else if (lastStcaConflictKeys.size > 0) {
+            broadcastMessage({
+                type: 'stca',
+                timestamp: Date.now(),
+                count: 0,
+                conflicts: []
+            });
+        }
+
+        lastStcaConflictKeys = newKeys;
+    } catch (err) {
+        console.error('[STCA] Engine error:', err.message);
+    }
+}, STCA_INTERVAL_MS);
+
+setInterval(() => {
     const removed = trackManager.cleanup();
     if (removed > 0) {
         broadcastMessage({
@@ -170,7 +227,8 @@ setInterval(() => {
     try {
         const mem = process.memoryUsage();
         const poolStats = trackManager.getPoolStats ? trackManager.getPoolStats() : {};
-        console.log(`[MEM] RSS=${(mem.rss/1048576).toFixed(1)}MB  HeapUsed=${(mem.heapUsed/1048576).toFixed(1)}/${(mem.heapTotal/1048576).toFixed(1)}MB  External=${(mem.external/1048576).toFixed(1)}MB  Tracks=${trackManager.getTrackCount()}  PoolStats=${JSON.stringify(poolStats)}`);
+        const stcaStats = stcaEngine.stats;
+        console.log(`[MEM] RSS=${(mem.rss/1048576).toFixed(1)}MB  HeapUsed=${(mem.heapUsed/1048576).toFixed(1)}/${(mem.heapTotal/1048576).toFixed(1)}MB  Tracks=${trackManager.getTrackCount()}  STCA[${stcaStats.conflictsFound} conflicts, ${stcaStats.avgCycleMs.toFixed(1)}ms/cycle]  Pool=${JSON.stringify(poolStats)}`);
     } catch (e) {}
 }, MEMORY_LOG_INTERVAL_MS);
 
@@ -200,7 +258,21 @@ app.get('/api/stats', (req, res) => {
             heapTotalMB: (mem.heapTotal / 1048576).toFixed(1)
         },
         pools: trackManager.getPoolStats ? trackManager.getPoolStats() : {},
-        trackBinarySize: TRACK_BINARY_SIZE
+        trackBinarySize: TRACK_BINARY_SIZE,
+        stca: {
+            activeConflicts: stcaEngine.conflictList.length,
+            totalAlerts: stcaAlertCount,
+            ...stcaEngine.stats
+        }
+    });
+});
+
+app.get('/api/stca', (req, res) => {
+    res.json({
+        timestamp: Date.now(),
+        count: stcaEngine.conflictList.length,
+        conflicts: stcaEngine.conflictList,
+        stats: stcaEngine.stats
     });
 });
 
@@ -284,7 +356,8 @@ async function start() {
     });
 
     console.log(`[WS] WebSocket server on ws://localhost:${WS_PORT} (${BROADCAST_HZ}Hz broadcast)`);
-    console.log(`[SYSTEM] ATC Radar Gateway ready — max 1200 targets @ 20FPS (zero-copy binary + object pool)`);
+    console.log(`[STCA] Conflict engine @ ${STCA_HZ}Hz (5NM/1000ft sep, 120s prediction)`);
+    console.log(`[SYSTEM] ATC Radar Gateway ready — max 1200 targets @ 20FPS + STCA`);
     try {
         const mem = process.memoryUsage();
         console.log(`[MEM] Initial: RSS=${(mem.rss/1048576).toFixed(1)}MB`);

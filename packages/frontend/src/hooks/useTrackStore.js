@@ -2,8 +2,10 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 
 export function useTrackStore(wsUrl) {
   const tracksRef = useRef(new Map());
+  const stcaConflictsRef = useRef([]);
+  const stcaConflictKeysRef = useRef(new Set());
   const [connected, setConnected] = useState(false);
-  const [stats, setStats] = useState({ count: 0, fps: 0 });
+  const [stats, setStats] = useState({ count: 0, fps: 0, stcaConflicts: 0 });
   const frameCountRef = useRef(0);
   const lastFpsTimeRef = useRef(Date.now());
   const listenersRef = useRef(new Set());
@@ -78,6 +80,16 @@ export function useTrackStore(wsUrl) {
             }
             setStats(s => ({ ...s, count: tracksRef.current.size }));
             notify();
+          } else if (msg.type === 'stca') {
+            const conflicts = msg.conflicts || [];
+            stcaConflictsRef.current = conflicts;
+            const keys = new Set();
+            for (const c of conflicts) {
+              keys.add(c.key1);
+              keys.add(c.key2);
+            }
+            stcaConflictKeysRef.current = keys;
+            setStats(s => ({ ...s, stcaConflicts: conflicts.length }));
           } else if (msg.type === 'cleanup') {
             for (const [key, t] of tracksRef.current) {
               if (Date.now() - (t.lastUpdate || 0) > 60000) {
@@ -132,6 +144,8 @@ export function useTrackStore(wsUrl) {
 
   return {
     tracksRef,
+    stcaConflictsRef,
+    stcaConflictKeysRef,
     connected,
     stats,
     subscribe,
