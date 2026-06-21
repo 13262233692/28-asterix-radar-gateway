@@ -1,0 +1,12 @@
+{
+  "name": "@asterix/simulator",
+  "version": "1.0.0",
+  "description": "Asterix Cat 048/062 radar data simulator for testing",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@asterix/native": "1.0.0"
+  }
+}

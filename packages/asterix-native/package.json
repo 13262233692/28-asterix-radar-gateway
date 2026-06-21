@@ -1,0 +1,15 @@
+{
+  "name": "@asterix/native",
+  "version": "1.0.0",
+  "description": "C++ N-API native extension for high-speed Asterix Cat 048/062 decoding",
+  "main": "index.js",
+  "gypfile": true,
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "build:debug": "node-gyp rebuild --debug"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp": "^10.0.1"
+  }
+}

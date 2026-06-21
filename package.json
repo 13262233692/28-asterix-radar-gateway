@@ -1,0 +1,19 @@
+{
+  "name": "asterix-radar-gateway",
+  "version": "1.0.0",
+  "description": "SSR Radar Data Processing & Display System for ATC Area Control Center",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build:native": "cd packages/asterix-native && node-gyp rebuild",
+    "start:backend": "cd packages/backend && node src/index.js",
+    "start:frontend": "cd packages/frontend && npm run dev",
+    "start:simulator": "cd packages/simulator && node src/index.js",
+    "start:all": "concurrently \"npm:start:backend\" \"npm:start:frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
